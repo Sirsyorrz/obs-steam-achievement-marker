@@ -9,7 +9,7 @@ OBS Python script that automatically adds a chapter marker to your recording whe
 
 ## Setup
 
-1. In OBS go to **Tools → Scripts 
+1. In OBS go to **Tools** → **Scripts** 
 2. Add `obs_steam_achievements.py` via the **+** button
 3. Start recording and play a Steam game
 
