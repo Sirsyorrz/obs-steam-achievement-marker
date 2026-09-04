@@ -67,13 +67,35 @@ def get_running_appid() -> str | None:
             except (PermissionError, FileNotFoundError, ProcessLookupError):
                 continue
     elif system == "Windows":
+        # Try registry first (fast)
         try:
             import winreg
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam\ActiveProcess")
-            appid, _ = winreg.QueryValueEx(key, "ActiveGameId")
-            winreg.CloseKey(key)
-            return str(appid) if appid and appid != 0 else None
+            for key_path, value_name in [
+                (r"Software\Valve\Steam", "RunningAppID"),
+                (r"Software\Valve\Steam\ActiveProcess", "ActiveGameId"),
+            ]:
+                try:
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path)
+                    appid, _ = winreg.QueryValueEx(key, value_name)
+                    winreg.CloseKey(key)
+                    if appid and appid != 0:
+                        return str(appid)
+                except OSError:
+                    continue
         except Exception:
+            pass
+        # Fallback: scan process environments (slower but reliable)
+        try:
+            import psutil
+            for proc in psutil.process_iter(["environ"]):
+                try:
+                    env = proc.info.get("environ") or {}
+                    appid = env.get("SteamAppId", "")
+                    if appid and appid != "0":
+                        return appid
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except ImportError:
             pass
     return None
 
