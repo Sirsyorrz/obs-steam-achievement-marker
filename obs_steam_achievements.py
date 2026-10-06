@@ -5,16 +5,14 @@ Add via OBS → Tools → Scripts.
 """
 
 import json
-import os
 import platform
 import queue
 import threading
-import time
 from pathlib import Path
 
 import obspython as obs
 
-# ── shared state (written by thread, read by main thread timer) ───────────────
+# ── shared state ──────────────────────────────────────────────────────────────
 
 _thread: threading.Thread | None = None
 _stop_event = threading.Event()
@@ -67,7 +65,6 @@ def get_running_appid() -> str | None:
             except (PermissionError, FileNotFoundError, ProcessLookupError):
                 continue
     elif system == "Windows":
-        # Try registry first (fast)
         try:
             import winreg
             for key_path, value_name in [
@@ -84,7 +81,6 @@ def get_running_appid() -> str | None:
                     continue
         except Exception:
             pass
-        # Fallback: scan process environments (slower but reliable)
         try:
             import psutil
             for proc in psutil.process_iter(["environ"]):
@@ -100,11 +96,28 @@ def get_running_appid() -> str | None:
     return None
 
 
-def load_achievements(cache_file: Path) -> dict[str, dict]:
+def find_cache_file(userdata: Path, steam_ids: list[str], appid: str) -> Path | None:
+    for sid in steam_ids:
+        p = userdata / sid / "config" / "librarycache" / f"{appid}.json"
+        if p.exists():
+            return p
+    return None
+
+
+def load_achievement_data(cache_file: Path) -> tuple[dict[str, str], set[str]]:
+    """
+    Returns (name_map, locked_ids) where:
+      name_map   = {id: display_name} for every achievement seen
+      locked_ids = IDs still in vecUnachieved (not yet unlocked)
+
+    Tracking disappearance from vecUnachieved (rather than bAchieved) correctly
+    handles multiple simultaneous unlocks — achievements leave vecUnachieved
+    regardless of whether they make it into vecHighlight.
+    """
     try:
         raw = json.loads(cache_file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return {}
+        return {}, set()
 
     data = {}
     if isinstance(raw, list):
@@ -115,37 +128,29 @@ def load_achievements(cache_file: Path) -> dict[str, dict]:
     elif isinstance(raw, dict):
         data = raw.get("achievements", raw)
 
-    all_entries = []
+    highlight = []
+    unachieved = []
     if isinstance(data, dict):
         inner = data.get("data", {})
         if isinstance(inner, dict):
-            all_entries = inner.get("vecHighlight", []) + inner.get("vecUnachieved", [])
-        elif isinstance(inner, list):
-            all_entries = inner
+            highlight = inner.get("vecHighlight", [])
+            unachieved = inner.get("vecUnachieved", [])
 
-    result = {}
-    for ach in all_entries:
+    name_map: dict[str, str] = {}
+    for ach in highlight + unachieved:
         if isinstance(ach, dict) and "strID" in ach:
-            result[ach["strID"]] = {
-                "name": ach.get("strName", ach["strID"]),
-                "unlocked": bool(ach.get("bAchieved", False)),
-            }
-    return result
+            name_map[ach["strID"]] = ach.get("strName", ach["strID"])
+
+    locked_ids = {ach["strID"] for ach in unachieved if isinstance(ach, dict) and "strID" in ach}
+    return name_map, locked_ids
 
 
-# ── watcher thread (no obs.* calls here) ─────────────────────────────────────
-
-def find_cache_file(userdata: Path, steam_ids: list[str], appid: str) -> Path | None:
-    for sid in steam_ids:
-        p = userdata / sid / "config" / "librarycache" / f"{appid}.json"
-        if p.exists():
-            return p
-    return None
-
+# ── watcher thread (no obs.* calls) ──────────────────────────────────────────
 
 def _watcher_thread(userdata: Path, steam_ids: list[str]):
     current_appid = None
-    known_state: dict[str, dict] = {}
+    name_map: dict[str, str] = {}   # accumulates names as they appear in cache
+    known_locked: set[str] = set()  # IDs currently in vecUnachieved
 
     _status_queue.put("Watching — no game detected")
 
@@ -155,26 +160,26 @@ def _watcher_thread(userdata: Path, steam_ids: list[str]):
 
             if appid != current_appid:
                 current_appid = appid
+                name_map = {}
+                known_locked = set()
                 if appid:
                     cache_file = find_cache_file(userdata, steam_ids, appid)
                     if cache_file:
-                        known_state = load_achievements(cache_file)
-                        _status_queue.put(f"Watching — AppID {appid} ({len(known_state)} achievements loaded)")
+                        name_map, known_locked = load_achievement_data(cache_file)
+                        _status_queue.put(f"Watching — AppID {appid} ({len(known_locked)} achievements remaining)")
                     else:
-                        known_state = {}
                         _status_queue.put(f"Watching — AppID {appid} (no achievement cache yet)")
                 else:
-                    known_state = {}
                     _status_queue.put("Watching — no game detected")
 
             if current_appid:
                 cache_file = find_cache_file(userdata, steam_ids, current_appid)
                 if cache_file:
-                    current_state = load_achievements(cache_file)
-                    for ach_id, info in current_state.items():
-                        if info["unlocked"] and not known_state.get(ach_id, {}).get("unlocked", False):
-                            _marker_queue.put(info["name"])
-                    known_state = current_state
+                    new_names, current_locked = load_achievement_data(cache_file)
+                    name_map.update(new_names)
+                    for ach_id in known_locked - current_locked:
+                        _marker_queue.put(name_map.get(ach_id, ach_id))
+                    known_locked = current_locked
 
         except Exception as e:
             _status_queue.put(f"Error: {e}")
@@ -182,12 +187,11 @@ def _watcher_thread(userdata: Path, steam_ids: list[str]):
         _stop_event.wait(POLL_INTERVAL)
 
 
-# ── main thread timer — drains queues and calls OBS API ──────────────────────
+# ── main thread timer ─────────────────────────────────────────────────────────
 
 def _tick():
     global _status
 
-    # Drain status updates (keep only latest)
     latest = None
     while not _status_queue.empty():
         try:
@@ -200,11 +204,9 @@ def _tick():
         if _settings:
             obs.obs_data_set_string(_settings, "status_display", _status)
 
-    # Drain and fire markers
     while not _marker_queue.empty():
         try:
-            name = _marker_queue.get_nowait()
-            _add_marker(name)
+            _add_marker(_marker_queue.get_nowait())
         except queue.Empty:
             break
 
@@ -268,20 +270,14 @@ def script_defaults(settings):
 
 def script_properties():
     props = obs.obs_properties_create()
-
     obs.obs_properties_add_text(props, "status_display", "Watcher status", obs.OBS_TEXT_DEFAULT)
-
     obs.obs_properties_add_text(props, "marker_prefix", "Marker prefix", obs.OBS_TEXT_DEFAULT)
-
     obs.obs_properties_add_path(props, "userdata_path", "Steam userdata path",
         obs.OBS_PATH_DIRECTORY, None, None)
-
     obs.obs_properties_add_button(props, "btn_restart", "Restart watcher", lambda p, s: (
         start_watcher(), False)[-1])
-
     obs.obs_properties_add_button(props, "btn_test", "Test marker", lambda p, s: (
         _add_marker("Test Achievement"), False)[-1])
-
     return props
 
 
