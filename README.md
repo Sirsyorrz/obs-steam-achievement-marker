@@ -15,6 +15,10 @@ OBS Python script that automatically adds a chapter marker to your recording whe
 
 Achievements will appear as named chapter markers (`🏆 Achievement Name`) in your recording timeline.
 
+## Requirements for markers to appear
+
+You must record in **MP4** or **Hybrid MP4** format in OBS. Chapter markers are not supported in MKV or other formats.
+
 ## Notes
 
 - Steam userdata path is auto-detected on Linux and Windows
